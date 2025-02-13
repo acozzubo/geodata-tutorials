@@ -1,0 +1,227 @@
+---
+title: "Geospatial Analysis in R"
+author: "Your Name"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Introduction
+
+This document explains the step-by-step geospatial analysis using R. The code below demonstrates the initialization of the R environment, data preprocessing, analysis, and visualization.
+
+## Virtual Environment Initialization
+
+We use the `renv` package to manage the virtual environment and `pacman` for streamlined package management.
+
+```{r renv-setup}
+library(renv)
+library(pacman)
+
+# Initialize renv virtual environment
+if (!file.exists("renv.lock")) {
+  renv::init() # Initialize the environment and create renv.lock if not already present
+} else {
+  renv::restore() # Restore the environment from renv.lock if it exists
+}
+
+# Install pacman if not already installed
+if (!requireNamespace("pacman", quietly = TRUE)) {
+  install.packages("pacman")
+}
+
+# Use pacman to load and install libraries
+pacman::p_load(
+  here,
+  sf,
+  dplyr,
+  ggplot2,
+  scales,
+  ggspatial,
+  cowplot,
+  tmap,
+  tictoc,
+  grid
+)
+```
+
+## Data Loading
+
+We load geospatial data and perform preprocessing for analysis. Shapefiles for Ecuador's political divisions and associated CSV data are read and prepared.
+
+```{r data-loading}
+# Working directory
+here::here("geodata_tutorials", "01_sessions", "R-versions")
+
+# Read shapefiles for Ecuador at different political levels
+borders <- st_read(here("02_data", "shapefiles", "nivel-politico-4.shp"))
+cantons <- st_read(here("02_data", "shapefiles", "nivel-politico-3.shp"))
+
+# Drop and rename columns in the borders shapefile
+borders <- borders %>%
+  select(-TERRITORY_, -CATEGORY, -TYPE, -LEVEL_1) %>%
+  rename(PARROQUIA = NAME, PROVINCIA = LEVEL_2, CANTON = LEVEL_3)
+
+# Load additional data
+df_final <- read.csv(here("02_data", "database", "df_final.csv"))
+```
+
+## Data Preparation
+
+Data from different years (2017, 2022, and 2032) is extracted and merged for comparative analysis.
+
+```{r data-preparation}
+# Prepare data for 2017, 2022, and 2032
+df_2017 <- df_final %>%
+  filter(year == 2017) %>%
+  select(parish_id, zonal_mean, PARROQUIA, PROVINCIA, CANTON) %>%
+  rename(zonal_mean_2017 = zonal_mean)
+
+df_2022 <- df_final %>%
+  filter(year == 2022) %>%
+  select(parish_id, zonal_mean, PARROQUIA, PROVINCIA, CANTON) %>%
+  rename(zonal_mean_2022 = zonal_mean)
+
+df_2032 <- df_final %>%
+  filter(year == 2032) %>%
+  select(parish_id, zonal_mean, PARROQUIA, PROVINCIA, CANTON) %>%
+  rename(zonal_mean_2032 = zonal_mean)
+
+# Merge data
+df_merged <- df_2017 %>%
+  left_join(df_2022, by = c("parish_id", "PARROQUIA", "PROVINCIA", "CANTON")) %>%
+  left_join(df_2032, by = c("parish_id", "PARROQUIA", "PROVINCIA", "CANTON"))
+```
+
+## Computation of Avoided Conversion and Restoration
+
+Avoided conversion and restoration metrics are calculated based on changes in zonal means over the years.
+
+```{r metrics-computation}
+# Compute avoided conversion
+min_diff <- min(abs(df_merged$zonal_mean_2032 - df_merged$zonal_mean_2022), na.rm = TRUE)
+max_diff <- max(abs(df_merged$zonal_mean_2032 - df_merged$zonal_mean_2022), na.rm = TRUE)
+
+df_merged <- df_merged %>%
+  mutate(
+    avoided_conversion = case_when(
+      is.na(zonal_mean_2032) | is.na(zonal_mean_2022) ~ NA,
+      (zonal_mean_2032 - zonal_mean_2022) >= 0 ~ 0,
+      max_diff > min_diff ~ (abs(zonal_mean_2032 - zonal_mean_2022) - min_diff) / (max_diff - min_diff),
+      TRUE ~ 0
+    )
+  )
+
+# Compute restoration
+min_diff <- min(abs(df_merged$zonal_mean_2022 - df_merged$zonal_mean_2017), na.rm = TRUE)
+max_diff <- max(abs(df_merged$zonal_mean_2022 - df_merged$zonal_mean_2017), na.rm = TRUE)
+
+df_merged <- df_merged %>%
+  mutate(
+    restoration = case_when(
+      is.na(zonal_mean_2022) | is.na(zonal_mean_2017) ~ NA,
+      (zonal_mean_2022 - zonal_mean_2017) >= 0 ~ 0,
+      max_diff > min_diff ~ (abs(zonal_mean_2022 - zonal_mean_2017) - min_diff) / (max_diff - min_diff),
+      TRUE ~ 0
+    )
+  )
+```
+
+## Geospatial Processing
+
+We merge data with shapefiles and ensure validity of geometries.
+
+```{r geospatial-processing}
+# Merge with shapefile
+gdf_final <- df_merged %>%
+  left_join(st_as_sf(borders), by = c("PARROQUIA", "PROVINCIA", "CANTON"))
+gdf_final <- st_as_sf(gdf_final) # Convert back to an sf object
+
+# Check for invalid geometries
+st_is_valid(gdf_final)
+
+# Fix invalid geometries
+gdf_final <- st_simplify(gdf_final, dTolerance = 0.01)
+gdf_final <- st_cast(gdf_final, "MULTIPOLYGON")
+gdf_final <- st_make_valid(gdf_final)
+```
+
+## Visualization
+
+A map visualizing the avoided conversion variable is created using `ggplot2`.
+
+```{r visualization}
+# Load boraders and water
+ecuador_borders <- st_read(here("02_data", "shapefiles", "ecuador_borders.shp"))
+ocean_borders <- st_read(here("02_data", "shapefiles", "ne_10m_ocean.shp")) 
+
+# Set CRS if needed and reproject to raster CRS
+# Replace 4326 with the appropriate EPSG code of your raster CRS
+raster_crs <- st_crs(4326)
+
+if (is.na(st_crs(ecuador_borders))) {
+  ecuador_borders <- st_set_crs(ecuador_borders, 4326)
+}
+ecuador_borders <- st_transform(ecuador_borders, raster_crs)
+
+if (is.na(st_crs(ocean_borders))) {
+  ocean_borders <- st_set_crs(ocean_borders, 4326)
+}
+ocean_borders <- st_transform(ocean_borders, raster_crs)
+
+# Replace NA values with 0 (or another appropriate value)
+gdf_final$avoided_conversion[is.na(gdf_final$avoided_conversion)] <- 0
+# Plot the avoided conversion variable
+# Plot the avoided conversion variable
+ggplot() +
+  # Plot ocean borders first
+  geom_sf(data = ocean_borders, fill = "#b2e8e8", alpha = 0.4, color = NA) +
+  # Plot Ecuador borders
+  geom_sf(data = ecuador_borders, fill = "#ffffff", color = "black", size = 0.5) +
+  geom_sf(data = st_boundary(ecuador_borders), color = "black", size = 0.6) +
+  # Plot avoided conversion with lighter, thinner borders
+  geom_sf(data = gdf_final, aes(fill = avoided_conversion), color = "black", size = 0.3) +
+  # Define the fill gradient with a horizontal color bar
+  scale_fill_gradientn(
+    colors = c("red", "white", "#00cc00"),
+    limits = c(0, 1),
+    name = "Avoided Conversion\n(0 = non-negative change)",
+    guide = guide_colorbar(
+      direction = "horizontal",   # Horizontal orientation
+      barwidth = unit(5, "cm"),   # Smaller width
+      barheight = unit(0.5, "cm"),# Smaller height
+      title.position = "top",     # Title above
+      title.hjust = 0.5           # Center-align title
+    )
+  ) +
+  # Set coordinate limits to focus on Ecuador
+  coord_sf(xlim = c(-81.5, -75), ylim = c(-5.5, 2.5)) +
+  # Add country and ocean labels
+  annotate("text", x = -76, y = -3.15, label = "PERU", size = 5, color = "black") +
+  annotate("text", x = -76, y = 1, label = "COLOMBIA", size = 5, color = "black") +
+  annotate("text", x = -80.9, y = 0, label = "PACIFIC\nOCEAN", size = 5, color = "#519ad0") +
+  # Add a scale bar and north arrow
+  annotation_scale(location = "bl", width_hint = 0.5) +
+  annotation_north_arrow(location = "tl", which_north = "true",
+                         style = north_arrow_fancy_orienteering()) +
+  # Customize theme and legend position
+  theme_minimal() +
+  theme(
+    legend.position = c(0.95, 0.1),    # Adjust legend position inside the plot
+    legend.justification = c(1, 0),   # Bottom-right alignment
+    legend.box.just = "right",        # Align legend elements to the right
+    legend.title = element_text(size = 9, face = "bold"),  # Smaller title text
+    legend.text = element_text(size = 7),                 # Smaller legend labels
+    legend.background = element_rect(fill = "white", color = NA, size = 0.3),
+    axis.text = element_blank(),
+    axis.ticks = element_blank(),
+    panel.grid = element_blank(),
+    panel.border = element_rect(color = "black", fill = NA, size = 1) # Add plot border
+  ) +
+  # Remove axis labels
+  labs(x = NULL, y = NULL) +
+  # Add plot title
+  ggtitle("Avoided Conversion Variable (2022 to 2032)")

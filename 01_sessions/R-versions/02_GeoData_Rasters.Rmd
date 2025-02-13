@@ -1,0 +1,175 @@
+---
+title: "Geospatial Analysis in R"
+author: "Your Name"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+### Understanding Raster Data
+
+#### **What is Raster Data?**
+
+Raster data represents geospatial information in a grid-like structure, where each cell (or pixel) has a value corresponding to a particular attribute, such as elevation, temperature, or land use. These values are usually continuous or discrete numerical data. Raster data is commonly used in remote sensing, environmental modeling, and geographic analysis because it efficiently handles large datasets and spatially continuous phenomena.
+
+#### **What is the TIFF Format?**
+
+The TIFF (Tagged Image File Format) is a widely used file format for storing raster data. It is particularly popular in geospatial applications when combined with metadata, forming a **GeoTIFF**. This metadata includes georeferencing information (e.g., projection, coordinates), allowing the file to be mapped accurately in geographic space. TIFF files support multiple bands (e.g., red, green, blue, and infrared for satellite images), making them versatile for remote sensing and analysis.
+
+#### **What is Resolution in Raster Data?**
+
+Resolution in raster data refers to the size of each cell in real-world units. For example, a raster with a 30-meter resolution means each pixel represents an area of 30 x 30 meters on the ground. Higher resolution (smaller cell size) provides more detailed spatial information but increases file size and computational demands. Resolution is critical in ensuring the suitability of data for specific analyses—coarser resolutions may miss fine details, while higher resolutions may capture unnecessary information for broader-scale studies.
+
+#### **What are Shapefiles?**
+
+Shapefiles (.shp) are a common vector data format used in Geographic Information Systems (GIS). Unlike raster data, vector data represents geographic features as points, lines, and polygons. Shapefiles are often used for data like administrative boundaries, road networks, and locations of interest. A shapefile actually consists of several files working together (e.g., .shp, .shx, .dbf) to store geometric shapes, spatial indexing, and attribute data.
+
+#### **Key Differences Between Raster and Shapefiles**
+
+| **Aspect** | **Raster Data** | **Shapefiles (Vector Data)** |
+|-----------------|----------------------------|---------------------------|
+| **Structure** | Grid of pixels (cells) | Points, lines, and polygons |
+| **Data Type** | Continuous or categorical values | Discrete features with attributes |
+| **File Format** | TIFF, GeoTIFF, etc. | Shapefile (.shp, .shx, .dbf) |
+| **Use Cases** | Elevation, satellite imagery, land use | Boundaries, roads, administrative zones |
+| **Resolution** | Fixed resolution (cell size) | No resolution—geometry determines precision |
+| **File Size** | Large for high resolution | Smaller for similar geographic extent |
+
+#### **Summary**
+
+Raster and vector data serve complementary purposes in geospatial analysis. Raster data is better for continuous phenomena like elevation or satellite imagery, while shapefiles excel at representing discrete features like administrative boundaries or road networks. Understanding their differences ensures effective usage in GIS projects.
+
+#### **Step 1: Import Necessary Libraries**
+First, import all the libraries required for data processing, handling geospatial data, and plotting.
+These libraries will help us handle raster files, manipulate geospatial data, and calculate zonal statistics efficiently.
+
+```{r setup, include=FALSE}
+# Use pacman for streamlined package management
+if (!requireNamespace("pacman", quietly = TRUE)) {
+  install.packages("pacman")
+}
+pacman::p_load(
+  raster,
+  terra,
+  sf,
+  ggplot2,
+  dplyr,
+  tidyr,
+  exactextractr
+)
+```
+
+
+```{r}
+# Define a function to process raster chunks
+process_chunk <- function(data_chunk) {
+  # Replace values 0, 3, and 4 with NA (missing values)
+  data_chunk[data_chunk %in% c(0, 3, 4)] <- NA
+  # Replace value 2 with 0
+  data_chunk[data_chunk == 2] <- 0
+  return(data_chunk)
+}
+```
+
+```{r}
+all_data <- list()  # Initialize a list to store processed data
+```
+
+```{r}
+for (year in 1985:1987) {
+  cat("Processing year", year, "\n")
+
+  # Load the raster file
+  raster_path <- paste0("../03_data/MB-Ecuador-", year, ".tif")
+  src <- raster(raster_path)
+
+  # Process raster in chunks
+  processed_data <- matrix(NA, nrow = nrow(src), ncol = ncol(src))
+
+  # Loop over raster blocks (simulate chunk processing)
+  for (row in seq(1, nrow(src), by = 1024)) {
+    for (col in seq(1, ncol(src), by = 1024)) {
+      # Define the block window
+      row_end <- min(row + 1023, nrow(src))
+      col_end <- min(col + 1023, ncol(src))
+
+      # Read a chunk of data
+      data_chunk <- as.matrix(crop(src, extent(src, row, row_end, col, col_end)))
+
+      # Process the chunk
+      processed_chunk <- process_chunk(data_chunk)
+
+      # Place processed data back into the full matrix
+      processed_data[row:row_end, col:col_end] <- processed_chunk
+    }
+  }
+
+  # Slice raster data (columns after 40,000)
+  sliced_data <- processed_data[, 40001:ncol(processed_data)]
+
+  # Get affine transform for the sliced data
+  new_transform <- extent(src)
+  new_transform@xmax <- new_transform@xmax - (ncol(src) - 40000) * xres(src)
+
+  # Load shapefile
+  shapefile_path <- '../03_data/shapefiles/nivel-politico-4.shp'
+  polygons <- st_read(shapefile_path)
+
+  # Ensure CRS is set to EPSG:4326 if not already set
+  if (is.na(st_crs(polygons))) {
+    st_crs(polygons) <- 4326  # EPSG:4326
+  }
+
+  # Reproject polygons to match raster CRS
+  polygons <- st_transform(polygons, crs = crs(src))
+
+  # Calculate zonal statistics
+  zonal_stats_results <- exact_extract(sliced_data, polygons, "mean", include_cell_values = FALSE)
+
+  # Add results and metadata to polygons
+  polygons$zonal_mean <- unlist(zonal_stats_results)
+  polygons$year <- year
+  polygons$parroquia_num <- seq_len(nrow(polygons))
+
+  # Drop unnecessary columns and rename
+  polygons <- polygons %>%
+    select(-c("TERRITORY_", "CATEGORY", "TYPE", "LEVEL_1", "geometry")) %>%
+    rename(PARROQUIA = NAME, PROVINCIA = LEVEL_2, CANTON = LEVEL_3)
+
+  # Add to list of all data
+  all_data[[length(all_data) + 1]] <- polygons
+
+  cat("Year", year, "processed\n")
+}
+```
+
+```{r}
+# Combine all processed data into a single dataframe
+final_df <- do.call(rbind, all_data)
+
+# Inspect the first few rows of the final dataframe
+print(head(final_df))
+
+# Uncomment to save final data to CSV
+# write.csv(final_df, "../03_data/database/parroquias-zonal-mean_try.csv", row.names = FALSE)
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
